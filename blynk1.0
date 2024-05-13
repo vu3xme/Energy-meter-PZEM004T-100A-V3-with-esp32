@@ -1,0 +1,180 @@
+#include <Arduino.h>
+#include <PZEM004Tv30.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <TimeLib.h>
+#include <time.h>
+/* Fill-in information from Blynk Device Info here */
+#define BLYNK_TEMPLATE_ID           "TMPL6DFpfA6Ow"
+#define BLYNK_TEMPLATE_NAME         "power"
+#define BLYNK_AUTH_TOKEN            "CyBvUJ--kloZRVGSNKi35udq8AMIGqom"
+#include <BlynkSimpleEsp32.h>
+
+// Define pins and serial ports
+#define PZEM_RX_PIN 16
+#define PZEM_TX_PIN 17
+#define PZEM_SERIAL Serial2
+#define CONSOLE_SERIAL Serial
+
+// WiFi credentials
+const char* ssid = "Printer";
+const char* password = "123456780";
+
+// NTP server
+const char* ntpServer = "pool.ntp.org";
+
+
+
+// Global variables
+WiFiClient wifiClient;
+AsyncWebServer server(80);
+PZEM004Tv30 pzem(PZEM_SERIAL, PZEM_RX_PIN, PZEM_TX_PIN);
+TaskHandle_t webServerTaskHandle = NULL;
+unsigned long bootTime = 0;
+
+// Forward declarations
+void webServerTask(void *parameter);
+void powerTask(void *parameter);
+String getCurrentDateTime();
+
+void setup() {
+    CONSOLE_SERIAL.begin(115200);
+
+    // Connect to WiFi
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(1000);
+        CONSOLE_SERIAL.println("Connecting to WiFi...");
+    }
+    CONSOLE_SERIAL.println("Connected to WiFi");
+
+    // Configure NTP time synchronization
+    configTime(0, 0, ntpServer);
+    
+    // Record boot time
+    bootTime = millis();
+
+    // Initialize web server
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+        // Handle root request
+        String content = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'><title>Power Monitoring</title>";
+        content += "<style>body{font-family:Arial, sans-serif;background-color:#101010;margin:0;padding:0;color:#fff;} .container{max-width:800px;margin:20px auto;padding:20px;background-color:#303030;box-shadow:0 0 10px rgba(0,0,0,0.1);}";
+        content += "h1, h2{color:#fff;} table{border-collapse:collapse;width:100%;} th, td{border:1px solid #dddddd;padding:8px;text-align:left;} button{background-color:#4CAF50;border:none;color:white;padding:10px 24px;text-align:center;text-decoration:none;display:inline-block;font-size:16px;margin:4px 2px;cursor:pointer;border-radius:5px;} button:hover{background-color:#45a049;} .refresh-btn{margin-top:20px;}</style></head>";
+        content += "<body><div class='container'><h1>Power Monitoring</h1><h2>Current Date and Time (Indian Time - Kolkata)</h2><p id='datetime'>" + getCurrentDateTime() + "</p>";
+        content += "<h2>Power Data</h2><table id='power-data'><tr><th>Parameter</th><th>Value</th></tr>";
+        // Fetch actual power data here
+        float voltage = pzem.voltage();
+        float current = pzem.current();
+        float power = pzem.power();
+        float energy = pzem.energy();
+        float frequency = pzem.frequency();
+        float pf = pzem.pf();
+        content += "<tr><td>Voltage (V)</td><td>" + String(voltage) + "</td></tr>";
+        content += "<tr><td>Current (A)</td><td>" + String(current) + "</td></tr>";
+        content += "<tr><td>Power (W)</td><td>" + String(power) + "</td></tr>";
+        content += "<tr><td>Energy (kWh)</td><td>" + String(energy, 3) + "</td></tr>";
+        content += "<tr><td>Frequency (Hz)</td><td>" + String(frequency, 1) + "</td></tr>";
+        content += "<tr><td>Power Factor</td><td>" + String(pf) + "</td></tr>";
+        content += "</table><div class='refresh-btn'><button onclick='refreshPage()'>Refresh</button></div></div>";
+        content += "<script>function refreshPage() { location.reload(); }</script>";
+        content += "<script>function updateTime() { var dt = new Date(); var options = {timeZone: 'Asia/Kolkata', hour12: false, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric'}; var datetime = dt.toLocaleDateString('en-IN', options); document.getElementById('datetime').innerHTML = datetime; } setInterval(updateTime, 1000);</script></body></html>";
+        request->send(200, "text/html", content);
+    });
+
+    // Start web server task
+    xTaskCreatePinnedToCore(
+        webServerTask,
+        "webServerTask",
+        10000,
+        NULL,
+        1,
+        &webServerTaskHandle,
+        1
+    );
+
+    // Start power monitoring task
+    xTaskCreatePinnedToCore(
+        powerTask,
+        "powerTask",
+        10000,
+        NULL,
+        1,
+        NULL,
+        0
+    );
+
+    // Initialize Blynk
+    Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+}
+
+void loop() {
+    // Run Blynk
+    Blynk.run();
+}
+
+void webServerTask(void *parameter) {
+    // Begin web server
+    server.begin();
+    for (;;) {
+        // Delay to allow web server to handle requests
+        vTaskDelay(1);
+    }
+}
+
+void powerTask(void *parameter) {
+    for (;;) {
+        // Read sensor data
+        float voltage = NAN; // Initialize voltage as NaN
+        float current = NAN;
+        float power = NAN;
+        float energy = NAN;
+        float frequency = NAN;
+        float pf = NAN;
+
+        // Retry reading sensor data up to 3 times
+        for (int i = 0; i < 3; i++) {
+            voltage = pzem.voltage();
+            if (!isnan(voltage)) {
+                // If voltage reading is successful, break the loop
+                break;
+            }
+            // Delay before retrying
+            delay(100);
+        }
+
+        // Check if voltage reading is successful
+        if (!isnan(voltage)) {
+            // Read other sensor data if voltage reading is successful
+            current = pzem.current();
+            power = pzem.power();
+            energy = pzem.energy();
+            frequency = pzem.frequency();
+            pf = pzem.pf();
+        } else {
+            // Print error message if voltage reading fails
+            CONSOLE_SERIAL.println("Failed to read voltage data");
+        }
+
+        // Upload data to Blynk
+        Blynk.virtualWrite(V0, voltage);
+        Blynk.virtualWrite(V1, current);
+        Blynk.virtualWrite(V2, power);
+        Blynk.virtualWrite(V3, energy);
+        Blynk.virtualWrite(V4, frequency);
+        Blynk.virtualWrite(V5, pf);
+
+        // Delay for next measurement
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+String getCurrentDateTime() {
+    time_t now = time(nullptr);
+    struct tm *timeinfo;
+    timeinfo = localtime(&now);
+    char dateTime[50];
+    strftime(dateTime, sizeof(dateTime), "%A, %B %d, %Y %H:%M:%S", timeinfo);
+    return String(dateTime);
+}
